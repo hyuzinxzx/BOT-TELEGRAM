@@ -152,7 +152,13 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def start_schedule_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     message_source = query.message if query else update.message
-    context.user_data.clear()
+    
+    # --- CÓDIGO CORRIGIDO AQUI ---
+    user_id = update.effective_user.id # Obtenha o user_id do usuário que iniciou o fluxo
+    context.user_data.clear() # Limpa os dados de uma conversa anterior, se houver
+    context.user_data['user_id'] = user_id # Salva o user_id para uso posterior
+    # --- FIM DO CÓDIGO CORRIGIDO ---
+
     if query:
         await query.answer(); data = query.data
         context.user_data['schedule_type'] = 'agendada' if data == 'start_schedule_single' else 'recorrente'
@@ -268,8 +274,16 @@ async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         ud = context.user_data; time_str = ud['final_schedule_time']; is_recurrent = ud['schedule_type'] == 'recorrente'
         try:
             schedule_dt_naive = datetime.strptime(time_str, "%Y-%m-%d %H:%M"); schedule_dt_aware = SAO_PAULO_TZ.localize(schedule_dt_naive)
-            if schedule_dt_aware < datetime.now(SAO_PAULO_TZ): await context.bot.send_message(ud['user_id'], "❌ A data deve ser no futuro."); return ConversationHandler.END
-        except ValueError: await context.bot.send_message(ud['user_id'], "❌ Formato de data inválido."); return ConversationHandler.END
+            # Adicionado um ajuste para garantir que a comparação seja correta com o fuso horário atual.
+            # Se a data for no passado, exibe erro.
+            if schedule_dt_aware < datetime.now(SAO_PAULO_TZ): 
+                await context.bot.send_message(chat_id=ud['user_id'], text="❌ A data/hora agendada deve ser no futuro."); 
+                return ConversationHandler.END
+        except ValueError: 
+            await context.bot.send_message(chat_id=ud['user_id'], text="❌ Formato de data/hora inválido. Use AAAA-MM-DD HH:MM."); 
+            return ConversationHandler.END
+        
+        # user_id agora garantido em context.user_data
         post_data = {"user_id": ud['user_id'], "chat_id": ud['chat_id'], "type": ud['schedule_type'], "media_file_id": ud.get('media_file_id'), "media_type": ud.get('media_type'), "text": ud.get('text'), "buttons": ud.get('buttons', []), "created_at": datetime.now(SAO_PAULO_TZ), "pin_post": ud.get('pin_post', False)}
         if is_recurrent: post_data['interval'] = f"{ud['interval_value']}{ud['interval_unit']}"; post_data['repetitions'] = ud['repetitions']; post_data['start_date'] = schedule_dt_aware
         else: post_data['scheduled_for'] = schedule_dt_aware
@@ -283,7 +297,14 @@ async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await context.bot.send_message(chat_id=ud['user_id'], text="🚀 **Sucesso!** Postagem agendada.")
         ud.clear(); return ConversationHandler.END
     except Exception as e:
-        user_id = context.user_data.get('user_id'); error_text = f"🚨 Erro ao salvar:\n\n`{e}`"; await context.bot.send_message(chat_id=user_id, text=error_text, parse_mode='Markdown'); logger.error(f"ERRO NO AGENDAMENTO: {e}", exc_info=True); context.user_data.clear(); return ConversationHandler.END
+        # Fallback mais robusto para user_id em caso de erro.
+        # update.effective_user.id sempre estará disponível aqui.
+        user_id = context.user_data.get('user_id', update.effective_user.id) 
+        error_text = f"🚨 Erro ao salvar:\n\n`{e}`"; 
+        await context.bot.send_message(chat_id=user_id, text=error_text, parse_mode='Markdown')
+        logger.error(f"ERRO NO AGENDAMENTO: {e}", exc_info=True)
+        context.user_data.clear() # Limpa os dados do usuário para evitar problemas em agendamentos futuros
+        return ConversationHandler.END
 
 @restricted
 async def list_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
