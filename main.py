@@ -36,7 +36,7 @@ except Exception as e:
 # --- Estados da Conversa ---
 (SELECT_CHANNEL, GET_MEDIA, GET_TEXT, GET_BUTTONS_PROMPT, GET_BUTTON_1_TEXT, GET_BUTTON_1_URL,
  GET_BUTTON_2_PROMPT, GET_BUTTON_2_TEXT, GET_BUTTON_2_URL, GET_PIN_OPTION, GET_SCHEDULE_TIME,
- GET_INTERVAL, GET_REPETITIONS, GET_START_TIME) = range(15)
+ GET_INTERVAL, GET_REPETITIONS, GET_START_TIME, AWAITING_CONFIRMATION) = range(15)
 
 # --- Decorator para Restringir Acesso ---
 def restricted(func):
@@ -86,8 +86,7 @@ async def reload_jobs_from_db(application: Application):
     if schedules_collection is None:
         logger.warning("Não foi possível recarregar os jobs, conexão com o DB indisponível.")
         return
-    logger.info("--- Iniciando recarregamento de jobs do MongoDB ---")
-    current_time = datetime.now(SAO_PAULO_TZ); jobs_reloaded = 0; jobs_deleted = 0
+    logger.info("--- Iniciando recarregamento de jobs do MongoDB ---"); current_time = datetime.now(SAO_PAULO_TZ); jobs_reloaded = 0; jobs_deleted = 0
     for post in list(schedules_collection.find({})):
         schedule_id_str = str(post['_id'])
         if post['type'] == 'agendada':
@@ -120,12 +119,7 @@ async def weekly_cleanup(context: ContextTypes.DEFAULT_TYPE):
 
 # --- Funções do Menu ---
 async def build_main_menu_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("🆕 Agendar Postagem Única", callback_data='start_schedule_single')],
-        [InlineKeyboardButton("🔁 Agendar Postagem Recorrente", callback_data='start_schedule_recurrent')],
-        [InlineKeyboardButton("📋 Listar Agendamentos", callback_data='menu_listar')],
-        [InlineKeyboardButton("❌ Cancelar (Ajuda)", callback_data='menu_cancelar_ajuda')]
-    ]
+    keyboard = [[InlineKeyboardButton("🆕 Agendar Postagem Única", callback_data='start_schedule_single')], [InlineKeyboardButton("🔁 Agendar Postagem Recorrente", callback_data='start_schedule_recurrent')], [InlineKeyboardButton("📋 Listar Agendamentos", callback_data='menu_listar')], [InlineKeyboardButton("❌ Cancelar (Ajuda)", callback_data='menu_cancelar_ajuda')]]
     return InlineKeyboardMarkup(keyboard)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str = "👇 Escolha uma opção:"):
@@ -144,7 +138,7 @@ async def handle_simple_menu_clicks(update: Update, context: ContextTypes.DEFAUL
         await list_posts(query, context)
         await show_main_menu(update, context, message_text="Aqui está sua lista. O que mais deseja fazer?")
     elif query.data == 'menu_cancelar_ajuda':
-        await query.message.reply_text("Para cancelar um agendamento, use: `/cancelar <ID>`\nO ID você encontra na listagem.", parse_mode='Markdown')
+        await query.message.reply_text("Para cancelar, use: `/cancelar <ID>`", parse_mode='Markdown')
 
 @restricted
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -157,12 +151,10 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 @restricted
 async def start_schedule_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    message_source = query.message if query else update.message
+    query = update.callback_query; message_source = query.message if query else update.message
     context.user_data.clear()
     if query:
-        await query.answer()
-        data = query.data
+        await query.answer(); data = query.data
         context.user_data['schedule_type'] = 'agendada' if data == 'start_schedule_single' else 'recorrente'
     else:
         command = update.message.text
@@ -243,34 +235,64 @@ async def get_repetitions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data['repetitions'] = repetitions
     await update.message.reply_text("Quando devo começar? (AAAA-MM-DD HH:MM)"); return GET_START_TIME
 
-async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE, is_recurrent: bool = False) -> int:
+async def pre_schedule_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['final_schedule_time'] = update.message.text
+    return await confirm_schedule_details(update, context)
+
+async def confirm_schedule_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ud = context.user_data
+    summary = f"📝 *Confirme os detalhes do agendamento:*\n\n"
+    summary += f"**Tipo:** {'Recorrente' if ud['schedule_type'] == 'recorrente' else 'Único'}\n"
+    summary += f"**Destino:** `{ud['chat_id']}`\n"
+    summary += f"**Mídia:** {'Sim' if ud.get('media_file_id') else 'Não'}\n"
+    summary += f"**Fixar:** {'Sim' if ud.get('pin_post', False) else 'Não'}\n"
+    if ud['schedule_type'] == 'recorrente':
+        summary += f"**Início:** `{ud['final_schedule_time']}`\n"
+        summary += f"**Intervalo:** `{ud.get('interval_value')}{ud.get('interval_unit')}`\n"
+        summary += f"**Repetições:** {'Infinitas' if ud.get('repetitions') == 0 else ud.get('repetitions')}\n"
+    else:
+        summary += f"**Data:** `{ud['final_schedule_time']}`\n"
+    keyboard = [[InlineKeyboardButton("✅ Confirmar", callback_data='confirm_yes')], [InlineKeyboardButton("❌ Cancelar", callback_data='confirm_no')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(summary, parse_mode='Markdown', reply_markup=reply_markup)
+    return AWAITING_CONFIRMATION
+
+async def process_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    if query.data == 'confirm_yes':
+        await query.edit_message_text("✅ Confirmado! Salvando e agendando...")
+        return await schedule_post(context)
+    else:
+        await query.edit_message_text("❌ Agendamento cancelado.")
+        return await cancel_conversation(update, context)
+
+async def schedule_post(context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        time_str = update.message.text
+        ud = context.user_data
+        time_str = ud['final_schedule_time']
+        is_recurrent = ud['schedule_type'] == 'recorrente'
         try:
             schedule_dt_naive = datetime.strptime(time_str, "%Y-%m-%d %H:%M"); schedule_dt_aware = SAO_PAULO_TZ.localize(schedule_dt_naive)
-            if schedule_dt_aware < datetime.now(SAO_PAULO_TZ): await update.message.reply_text("❌ A data deve ser no futuro."); return GET_SCHEDULE_TIME if not is_recurrent else GET_START_TIME
-        except ValueError: await update.message.reply_text("❌ Formato de data inválido."); return GET_SCHEDULE_TIME if not is_recurrent else GET_START_TIME
-        post_data = {"user_id": update.effective_user.id, "chat_id": context.user_data['chat_id'], "type": context.user_data['schedule_type'], "media_file_id": context.user_data.get('media_file_id'), "media_type": context.user_data.get('media_type'), "text": context.user_data.get('text'), "buttons": context.user_data.get('buttons', []), "created_at": datetime.now(SAO_PAULO_TZ), "pin_post": context.user_data.get('pin_post', False)}
-        if is_recurrent: post_data['interval'] = f"{context.user_data['interval_value']}{context.user_data['interval_unit']}"; post_data['repetitions'] = context.user_data['repetitions']; post_data['start_date'] = schedule_dt_aware
+            if schedule_dt_aware < datetime.now(SAO_PAULO_TZ): await context.bot.send_message(ud['user_id'], "❌ A data deve ser no futuro."); return ConversationHandler.END
+        except ValueError: await context.bot.send_message(ud['user_id'], "❌ Formato de data inválido."); return ConversationHandler.END
+        post_data = {"user_id": ud['user_id'], "chat_id": ud['chat_id'], "type": ud['schedule_type'], "media_file_id": ud.get('media_file_id'), "media_type": ud.get('media_type'), "text": ud.get('text'), "buttons": ud.get('buttons', []), "created_at": datetime.now(SAO_PAULO_TZ), "pin_post": ud.get('pin_post', False)}
+        if is_recurrent: post_data['interval'] = f"{ud['interval_value']}{ud['interval_unit']}"; post_data['repetitions'] = ud['repetitions']; post_data['start_date'] = schedule_dt_aware
         else: post_data['scheduled_for'] = schedule_dt_aware
         result = schedules_collection.insert_one(post_data); schedule_id = result.inserted_id
         job_data = {"schedule_id": str(schedule_id)}
         if is_recurrent:
-            unit = context.user_data['interval_unit']; value = context.user_data['interval_value']
+            unit = ud['interval_unit']; value = ud['interval_value']
             interval_kwargs = {'minutes': value} if unit == 'm' else {'hours': value} if unit == 'h' else {'days': value}
             context.job_queue.run_repeating(send_post, interval=timedelta(**interval_kwargs), first=schedule_dt_aware, name=str(schedule_id), data=job_data)
         else: context.job_queue.run_once(send_post, schedule_dt_aware, name=str(schedule_id), data=job_data)
-        await update.message.reply_text("🚀 **Sucesso!** Postagem agendada.", reply_markup=ReplyKeyboardRemove()); context.user_data.clear(); return ConversationHandler.END
+        await context.bot.send_message(chat_id=ud['user_id'], text="🚀 **Sucesso!** Postagem agendada.")
+        ud.clear(); return ConversationHandler.END
     except Exception as e:
-        user_id = update.effective_user.id; error_text = f"🚨 Erro ao salvar:\n\n`{e}`"; await context.bot.send_message(chat_id=user_id, text=error_text, parse_mode='Markdown'); logger.error(f"ERRO NO AGENDAMENTO: {e}", exc_info=True); context.user_data.clear(); return ConversationHandler.END
-
-async def schedule_single_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int: return await schedule_post(update, context, is_recurrent=False)
-async def schedule_recurrent_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int: return await schedule_post(update, context, is_recurrent=True)
+        user_id = context.user_data.get('user_id'); error_text = f"🚨 Erro ao salvar:\n\n`{e}`"; await context.bot.send_message(chat_id=user_id, text=error_text, parse_mode='Markdown'); logger.error(f"ERRO NO AGENDAMENTO: {e}", exc_info=True); context.user_data.clear(); return ConversationHandler.END
 
 @restricted
 async def list_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message_source = update.callback_query.message if update.callback_query else update.message
-    message = "📅 *Suas Postagens Agendadas*\n\n"; found_any = False
+    message_source = update.callback_query.message if update.callback_query else update.message; message = "📅 *Suas Postagens Agendadas*\n\n"; found_any = False
     if schedules_collection is not None:
         for post in schedules_collection.find({"user_id": update.effective_user.id}).sort("created_at", -1):
             found_any = True; post_type = "Agendada" if post['type'] == 'agendada' else "Recorrente"; text_snippet = (post.get('text') or "Sem texto")[:50] + "..."
@@ -303,8 +325,7 @@ def run_flask(): app.run(host='0.0.0.0', port=8080)
 
 # --- Função Principal ---
 def main() -> None:
-    if not all([TELEGRAM_TOKEN, MONGO_URI, ADMIN_IDS]):
-        logger.error("ERRO CRÍTICO: Variáveis de ambiente não foram definidas."); return
+    if not all([TELEGRAM_TOKEN, MONGO_URI, ADMIN_IDS]): logger.error("ERRO CRÍTICO: Variáveis de ambiente não foram definidas."); return
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(reload_jobs_from_db).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('agendar', start_schedule_flow), CommandHandler('recorrente', start_schedule_flow), CallbackQueryHandler(start_schedule_flow, pattern='^start_schedule_')],
@@ -314,22 +335,18 @@ def main() -> None:
             GET_BUTTON_1_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_1_text)], GET_BUTTON_1_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_1_url)],
             GET_BUTTON_2_PROMPT: [MessageHandler(filters.Regex('^(Adicionar 2º Botão|Finalizar Botões)$'), get_button_2_prompt)], GET_BUTTON_2_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_2_text)],
             GET_BUTTON_2_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_2_url)], GET_PIN_OPTION: [MessageHandler(filters.Regex('^(Sim, fixar e substituir|Não, postagem normal)$'), get_pin_option)],
-            GET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_single_post)], GET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_interval)],
-            GET_REPETITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_repetitions)], GET_START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_recurrent_post)],
+            GET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, pre_schedule_confirmation)], GET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_interval)],
+            GET_REPETITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_repetitions)], GET_START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, pre_schedule_confirmation)],
+            AWAITING_CONFIRMATION: [CallbackQueryHandler(process_confirmation, pattern='^confirm_')]
         },
         fallbacks=[CommandHandler('cancelar_conversa', cancel_conversation)],
     )
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("menu", menu_command))
-    application.add_handler(CommandHandler("listagem", list_posts))
-    application.add_handler(CommandHandler("cancelar", cancel_post))
-    application.add_handler(CallbackQueryHandler(handle_simple_menu_clicks, pattern='^menu_'))
-    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("start", start_command)); application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("listagem", list_posts)); application.add_handler(CommandHandler("cancelar", cancel_post))
+    application.add_handler(CallbackQueryHandler(handle_simple_menu_clicks, pattern='^menu_')); application.add_handler(conv_handler)
     job_queue = application.job_queue
     job_queue.run_daily(weekly_cleanup, time=time(hour=3, minute=0, tzinfo=SAO_PAULO_TZ), days=(6,), name="weekly_cleanup_job")
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
+    flask_thread = Thread(target=run_flask); flask_thread.daemon = True; flask_thread.start()
     application.run_polling()
 
 if __name__ == "__main__":
