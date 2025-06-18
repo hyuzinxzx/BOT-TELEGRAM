@@ -35,8 +35,8 @@ except Exception as e:
 
 # --- Estados da Conversa ---
 (SELECT_CHANNEL, GET_MEDIA, GET_TEXT, GET_BUTTONS_PROMPT, GET_BUTTON_1_TEXT, GET_BUTTON_1_URL,
- GET_BUTTON_2_PROMPT, GET_BUTTON_2_TEXT, GET_BUTTON_2_URL, GET_SCHEDULE_TIME,
- GET_INTERVAL, GET_REPETITIONS, GET_START_TIME) = range(13)
+ GET_BUTTON_2_PROMPT, GET_BUTTON_2_TEXT, GET_BUTTON_2_URL, GET_PIN_OPTION, GET_SCHEDULE_TIME,
+ GET_INTERVAL, GET_REPETITIONS, GET_START_TIME) = range(15)
 
 # --- Decorator para Restringir Acesso ---
 def restricted(func):
@@ -44,10 +44,8 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         if user and user.id not in ADMIN_IDS:
-            if update.callback_query:
-                await update.callback_query.answer("Acesso Negado!", show_alert=True)
-            else:
-                await update.message.reply_text("🔒 *Acesso Negado!*", parse_mode='Markdown')
+            if update.callback_query: await update.callback_query.answer("Acesso Negado!", show_alert=True)
+            else: await update.message.reply_text("🔒 *Acesso Negado!*", parse_mode='Markdown')
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
@@ -58,27 +56,37 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE):
     schedule_id = ObjectId(job.data["schedule_id"])
     post = schedules_collection.find_one({"_id": schedule_id})
     if not post:
-        logger.warning(f"Post com ID {schedule_id} não encontrado. Removendo job.")
-        job.schedule_next_run_time = None
-        return
-    chat_id = post["chat_id"]; text = post.get("text", ""); media_file_id = post.get("media_file_id"); media_type = post.get("media_type"); buttons_data = post.get("buttons", []); reply_markup = None
-    if buttons_data:
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(b['text'], url=b['url'])] for b in buttons_data])
+        logger.warning(f"Post com ID {schedule_id} não encontrado. Removendo job."); job.schedule_next_run_time = None; return
+    chat_id = post["chat_id"]; text = post.get("text", ""); media_file_id = post.get("media_file_id"); media_type = post.get("media_type"); buttons_data = post.get("buttons", []); pin_post = post.get("pin_post", False); last_message_id = post.get("last_sent_message_id")
+    if pin_post and last_message_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=last_message_id)
+            logger.info(f"Mensagem anterior {last_message_id} apagada com sucesso no chat {chat_id}.")
+        except telegram_error.BadRequest as e: logger.warning(f"Não foi possível apagar a mensagem anterior {last_message_id}: {e}")
+    reply_markup = None
+    if buttons_data: reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(b['text'], url=b['url'])] for b in buttons_data])
     try:
-        caption_to_send = text if media_type else None; text_to_send = text if not media_type else None
-        if media_type == "photo": await context.bot.send_photo(chat_id=chat_id, photo=media_file_id, caption=caption_to_send, reply_markup=reply_markup, parse_mode='Markdown')
-        elif media_type == "video": await context.bot.send_video(chat_id=chat_id, video=media_file_id, caption=caption_to_send, reply_markup=reply_markup, parse_mode='Markdown')
-        else: await context.bot.send_message(chat_id=chat_id, text=text_to_send, reply_markup=reply_markup, parse_mode='Markdown')
-        if post["type"] == "agendada":
-            schedules_collection.delete_one({"_id": schedule_id}); logger.info(f"Post agendado {schedule_id} enviado e removido.")
+        sent_message = None; caption_to_send = text if media_type else None; text_to_send = text if not media_type else None
+        if media_type == "photo": sent_message = await context.bot.send_photo(chat_id=chat_id, photo=media_file_id, caption=caption_to_send, reply_markup=reply_markup, parse_mode='Markdown')
+        elif media_type == "video": sent_message = await context.bot.send_video(chat_id=chat_id, video=media_file_id, caption=caption_to_send, reply_markup=reply_markup, parse_mode='Markdown')
+        else: sent_message = await context.bot.send_message(chat_id=chat_id, text=text_to_send, reply_markup=reply_markup, parse_mode='Markdown')
+        if pin_post and sent_message:
+            try:
+                await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent_message.message_id, disable_notification=True)
+                schedules_collection.update_one({'_id': schedule_id}, {'$set': {'last_sent_message_id': sent_message.message_id}})
+                logger.info(f"Nova mensagem {sent_message.message_id} fixada e ID salvo no DB.")
+            except telegram_error.BadRequest as e: logger.error(f"Não foi possível fixar a nova mensagem {sent_message.message_id}: {e}")
+        if post["type"] == "agendada": schedules_collection.delete_one({"_id": schedule_id}); logger.info(f"Post agendado {schedule_id} enviado e removido.")
         elif post.get("repetitions") is not None:
             if post["repetitions"] == 1: schedules_collection.delete_one({"_id": schedule_id}); job.schedule_next_run_time = None; logger.info(f"Post recorrente {schedule_id} completou repetições.")
             elif post["repetitions"] != 0: schedules_collection.update_one({"_id": schedule_id}, {"$inc": {"repetitions": -1}})
     except Exception as e: logger.error(f"Erro ao enviar post {schedule_id} para {chat_id}: {e}")
 
 async def reload_jobs_from_db(application: Application):
-    if schedules_collection is None: return
-    logger.info("--- Recarregando jobs do MongoDB ---")
+    if schedules_collection is None:
+        logger.warning("Não foi possível recarregar os jobs, conexão com o DB indisponível.")
+        return
+    logger.info("--- Iniciando recarregamento de jobs do MongoDB ---")
     current_time = datetime.now(SAO_PAULO_TZ); jobs_reloaded = 0; jobs_deleted = 0
     for post in list(schedules_collection.find({})):
         schedule_id_str = str(post['_id'])
@@ -112,22 +120,31 @@ async def weekly_cleanup(context: ContextTypes.DEFAULT_TYPE):
 
 # --- Funções do Menu ---
 async def build_main_menu_keyboard():
-    keyboard = [[InlineKeyboardButton("🆕 Agendar Postagem Única", callback_data='menu_agendar_single')], [InlineKeyboardButton("🔁 Agendar Postagem Recorrente", callback_data='menu_agendar_recorrente')], [InlineKeyboardButton("📋 Listar Agendamentos", callback_data='menu_listar')], [InlineKeyboardButton("❌ Cancelar (Ajuda)", callback_data='menu_cancelar_ajuda')]]
+    keyboard = [
+        [InlineKeyboardButton("🆕 Agendar Postagem Única", callback_data='start_schedule_single')],
+        [InlineKeyboardButton("🔁 Agendar Postagem Recorrente", callback_data='start_schedule_recurrent')],
+        [InlineKeyboardButton("📋 Listar Agendamentos", callback_data='menu_listar')],
+        [InlineKeyboardButton("❌ Cancelar (Ajuda)", callback_data='menu_cancelar_ajuda')]
+    ]
     return InlineKeyboardMarkup(keyboard)
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str = "👇 Escolha uma opção:"):
     reply_markup = await build_main_menu_keyboard()
-    await update.message.reply_text("👇 Escolha uma opção:", reply_markup=reply_markup)
+    if update.callback_query:
+        try: await update.callback_query.edit_message_text(text=message_text, reply_markup=reply_markup)
+        except telegram_error.BadRequest as e:
+            if "Message is not modified" not in str(e): logger.warning(f"Erro ao editar mensagem do menu: {e}")
+    else: await update.message.reply_text(text=message_text, reply_markup=reply_markup)
 
-# --- Comandos e Lógica da Conversa ---
+# --- Handlers (Processadores de Ações) ---
 @restricted
-async def handle_inline_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_simple_menu_clicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query; await query.answer()
-    data = query.data
-    if data == 'menu_agendar_single': await query.message.reply_text("Para agendar um post único, envie: /agendar")
-    elif data == 'menu_agendar_recorrente': await query.message.reply_text("Para agendar um post recorrente, envie: /recorrente")
-    elif data == 'menu_listar': await list_posts(query, context)
-    elif data == 'menu_cancelar_ajuda': await query.message.reply_text("Para cancelar, use: `/cancelar <ID>`", parse_mode='Markdown')
+    if query.data == 'menu_listar':
+        await list_posts(query, context)
+        await show_main_menu(update, context, message_text="Aqui está sua lista. O que mais deseja fazer?")
+    elif query.data == 'menu_cancelar_ajuda':
+        await query.message.reply_text("Para cancelar um agendamento, use: `/cancelar <ID>`\nO ID você encontra na listagem.", parse_mode='Markdown')
 
 @restricted
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -140,9 +157,17 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 @restricted
 async def start_schedule_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear(); command = update.message.text
-    context.user_data['schedule_type'] = 'agendada' if 'agendar' in command.lower() else 'recorrente'
-    await update.message.reply_text("Ok, vamos criar uma nova postagem! ✨\n\nPrimeiro, envie o ID do canal/grupo.", reply_markup=ReplyKeyboardRemove()); return SELECT_CHANNEL
+    query = update.callback_query
+    message_source = query.message if query else update.message
+    context.user_data.clear()
+    if query:
+        await query.answer()
+        data = query.data
+        context.user_data['schedule_type'] = 'agendada' if data == 'start_schedule_single' else 'recorrente'
+    else:
+        command = update.message.text
+        context.user_data['schedule_type'] = 'agendada' if 'agendar' in command.lower() else 'recorrente'
+    await message_source.reply_text("Ok, vamos criar uma nova postagem! ✨\n\nPrimeiro, envie o ID do canal/grupo.", reply_markup=ReplyKeyboardRemove()); return SELECT_CHANNEL
 
 async def get_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
@@ -166,7 +191,7 @@ async def get_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def get_buttons_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if 'adicionar' in update.message.text.lower():
         context.user_data['buttons'] = []; await update.message.reply_text("Qual o **texto do primeiro botão**?", reply_markup=ReplyKeyboardRemove()); return GET_BUTTON_1_TEXT
-    else: context.user_data['buttons'] = []; return await ask_for_schedule_time(update, context)
+    else: context.user_data['buttons'] = []; return await ask_to_pin(update, context)
 
 async def get_button_1_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['current_button_text'] = update.message.text; await update.message.reply_text("Agora, envie o **LINK (URL)**."); return GET_BUTTON_1_URL
@@ -181,7 +206,7 @@ async def get_button_1_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def get_button_2_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if 'adicionar' in update.message.text.lower():
         await update.message.reply_text("Qual o **texto do segundo botão**?", reply_markup=ReplyKeyboardRemove()); return GET_BUTTON_2_TEXT
-    else: return await ask_for_schedule_time(update, context)
+    else: return await ask_to_pin(update, context)
 
 async def get_button_2_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['current_button_text'] = update.message.text; await update.message.reply_text("E qual o **LINK (URL)**?"); return GET_BUTTON_2_URL
@@ -189,7 +214,16 @@ async def get_button_2_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def get_button_2_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = update.message.text
     if not (url.startswith('http://') or url.startswith('https://')): await update.message.reply_text("❌ Link inválido."); return GET_BUTTON_2_URL
-    context.user_data['buttons'].append({'text': context.user_data['current_button_text'], 'url': url}); return await ask_for_schedule_time(update, context)
+    context.user_data['buttons'].append({'text': context.user_data['current_button_text'], 'url': url}); return await ask_to_pin(update, context)
+
+async def ask_to_pin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    reply_keyboard = [['Sim, fixar e substituir'], ['Não, postagem normal']]
+    await update.message.reply_text("Deseja que esta postagem seja fixada (substituindo a anterior a cada envio)?", reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
+    return GET_PIN_OPTION
+
+async def get_pin_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['pin_post'] = 'sim' in update.message.text.lower()
+    return await ask_for_schedule_time(update, context)
 
 async def ask_for_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if context.user_data['schedule_type'] == 'recorrente':
@@ -216,7 +250,7 @@ async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE, is_r
             schedule_dt_naive = datetime.strptime(time_str, "%Y-%m-%d %H:%M"); schedule_dt_aware = SAO_PAULO_TZ.localize(schedule_dt_naive)
             if schedule_dt_aware < datetime.now(SAO_PAULO_TZ): await update.message.reply_text("❌ A data deve ser no futuro."); return GET_SCHEDULE_TIME if not is_recurrent else GET_START_TIME
         except ValueError: await update.message.reply_text("❌ Formato de data inválido."); return GET_SCHEDULE_TIME if not is_recurrent else GET_START_TIME
-        post_data = {"user_id": update.effective_user.id, "chat_id": context.user_data['chat_id'], "type": context.user_data['schedule_type'], "media_file_id": context.user_data.get('media_file_id'), "media_type": context.user_data.get('media_type'), "text": context.user_data.get('text'), "buttons": context.user_data.get('buttons', []), "created_at": datetime.now(SAO_PAULO_TZ)}
+        post_data = {"user_id": update.effective_user.id, "chat_id": context.user_data['chat_id'], "type": context.user_data['schedule_type'], "media_file_id": context.user_data.get('media_file_id'), "media_type": context.user_data.get('media_type'), "text": context.user_data.get('text'), "buttons": context.user_data.get('buttons', []), "created_at": datetime.now(SAO_PAULO_TZ), "pin_post": context.user_data.get('pin_post', False)}
         if is_recurrent: post_data['interval'] = f"{context.user_data['interval_value']}{context.user_data['interval_unit']}"; post_data['repetitions'] = context.user_data['repetitions']; post_data['start_date'] = schedule_dt_aware
         else: post_data['scheduled_for'] = schedule_dt_aware
         result = schedules_collection.insert_one(post_data); schedule_id = result.inserted_id
@@ -237,9 +271,10 @@ async def schedule_recurrent_post(update: Update, context: ContextTypes.DEFAULT_
 async def list_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_source = update.callback_query.message if update.callback_query else update.message
     message = "📅 *Suas Postagens Agendadas*\n\n"; found_any = False
-    for post in schedules_collection.find({"user_id": update.effective_user.id}).sort("created_at", -1):
-        found_any = True; post_type = "Agendada" if post['type'] == 'agendada' else "Recorrente"; text_snippet = (post.get('text') or "Sem texto")[:50] + "..."
-        message += f"🆔 `{post['_id']}`\n🎯 `Alvo`: {post['chat_id']}\n🔄 `Tipo`: {post_type}\n📝 `Texto`: _{text_snippet}_\n\n"
+    if schedules_collection is not None:
+        for post in schedules_collection.find({"user_id": update.effective_user.id}).sort("created_at", -1):
+            found_any = True; post_type = "Agendada" if post['type'] == 'agendada' else "Recorrente"; text_snippet = (post.get('text') or "Sem texto")[:50] + "..."
+            message += f"🆔 `{post['_id']}`\n🎯 `Alvo`: {post['chat_id']}\n🔄 `Tipo`: {post_type}\n📝 `Texto`: _{text_snippet}_\n\n"
     if not found_any: message = "Você ainda não tem postagens agendadas."
     await message_source.reply_text(message, parse_mode='Markdown')
 
@@ -272,15 +307,15 @@ def main() -> None:
         logger.error("ERRO CRÍTICO: Variáveis de ambiente não foram definidas."); return
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(reload_jobs_from_db).build()
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('agendar', start_schedule_flow), CommandHandler('recorrente', start_schedule_flow)],
+        entry_points=[CommandHandler('agendar', start_schedule_flow), CommandHandler('recorrente', start_schedule_flow), CallbackQueryHandler(start_schedule_flow, pattern='^start_schedule_')],
         states={
             SELECT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_channel)], GET_MEDIA: [MessageHandler(filters.ALL & ~filters.COMMAND, get_media)],
             GET_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_text)], GET_BUTTONS_PROMPT: [MessageHandler(filters.Regex('^(Adicionar Botão|Pular)$'), get_buttons_prompt)],
             GET_BUTTON_1_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_1_text)], GET_BUTTON_1_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_1_url)],
             GET_BUTTON_2_PROMPT: [MessageHandler(filters.Regex('^(Adicionar 2º Botão|Finalizar Botões)$'), get_button_2_prompt)], GET_BUTTON_2_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_2_text)],
-            GET_BUTTON_2_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_2_url)], GET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_single_post)],
-            GET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_interval)], GET_REPETITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_repetitions)],
-            GET_START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_recurrent_post)],
+            GET_BUTTON_2_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_2_url)], GET_PIN_OPTION: [MessageHandler(filters.Regex('^(Sim, fixar e substituir|Não, postagem normal)$'), get_pin_option)],
+            GET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_single_post)], GET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_interval)],
+            GET_REPETITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_repetitions)], GET_START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_recurrent_post)],
         },
         fallbacks=[CommandHandler('cancelar_conversa', cancel_conversation)],
     )
@@ -288,7 +323,7 @@ def main() -> None:
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("listagem", list_posts))
     application.add_handler(CommandHandler("cancelar", cancel_post))
-    application.add_handler(CallbackQueryHandler(handle_inline_menu, pattern='^menu_'))
+    application.add_handler(CallbackQueryHandler(handle_simple_menu_clicks, pattern='^menu_'))
     application.add_handler(conv_handler)
     job_queue = application.job_queue
     job_queue.run_daily(weekly_cleanup, time=time(hour=3, minute=0, tzinfo=SAO_PAULO_TZ), days=(6,), name="weekly_cleanup_job")
