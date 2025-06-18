@@ -1,8 +1,9 @@
 import logging
 import os
 from datetime import datetime, timedelta
-
 import pytz
+from functools import wraps
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bson import ObjectId
 from flask import Flask
@@ -11,12 +12,10 @@ from threading import Thread
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
                     ReplyKeyboardMarkup, ReplyKeyboardRemove)
 from telegram.ext import (Application, CommandHandler, ConversationHandler,
-                          MessageHandler, filters, ContextTypes, CallbackQueryHandler)
+                          MessageHandler, filters, ContextTypes)
 
 # --- Configurações Iniciais ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Variáveis de Ambiente e Constantes ---
@@ -24,7 +23,6 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 MONGO_URI = os.environ.get('MONGO_URI')
 ADMIN_IDS_STR = os.environ.get('ADMIN_IDS', '')
 ADMIN_IDS = [int(admin_id) for admin_id in ADMIN_IDS_STR.split(',') if admin_id]
-
 SAO_PAULO_TZ = pytz.timezone("America/Sao_Paulo")
 
 # --- Conexão com o Banco de Dados (MongoDB) ---
@@ -35,10 +33,7 @@ try:
     logger.info("Conexão com MongoDB estabelecida com sucesso.")
 except Exception as e:
     logger.error(f"Não foi possível conectar ao MongoDB: {e}")
-    client = None
-    db = None
-    schedules_collection = None
-
+    client = None; db = None; schedules_collection = None
 
 # --- Estados da Conversa ---
 (SELECT_CHANNEL, GET_MEDIA, GET_TEXT, GET_BUTTONS_PROMPT, GET_BUTTON_1_TEXT, GET_BUTTON_1_URL,
@@ -47,26 +42,22 @@ except Exception as e:
 
 # --- Decorator para Restringir Acesso ---
 def restricted(func):
+    @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text(
-                "🔒 *Acesso Negado!* 🔒\n\n"
-                "Desculpe, você não tem permissão para usar meus comandos.",
-                parse_mode='Markdown'
-            )
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.message.reply_text("🔒 *Acesso Negado!*", parse_mode='Markdown')
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-# --- Funções do Agendador (Scheduler) ---
+# --- Funções do Agendador ---
 async def send_post(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     schedule_id = ObjectId(job.data["schedule_id"])
     post = schedules_collection.find_one({"_id": schedule_id})
 
     if not post:
-        logger.warning(f"Post com ID {schedule_id} não encontrado no DB. Removendo job.")
+        logger.warning(f"Post com ID {schedule_id} não encontrado. Removendo job.")
         job.schedule_next_run_time = None
         return
 
@@ -89,21 +80,19 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(chat_id=chat_id, photo=media_file_id, caption=caption_to_send, reply_markup=reply_markup, parse_mode='Markdown')
         elif media_type == "video":
             await context.bot.send_video(chat_id=chat_id, video=media_file_id, caption=caption_to_send, reply_markup=reply_markup, parse_mode='Markdown')
-        else: # Apenas texto
-             await context.bot.send_message(chat_id=chat_id, text=text_to_send, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text_to_send, reply_markup=reply_markup, parse_mode='Markdown')
 
         if post["type"] == "agendada":
             schedules_collection.delete_one({"_id": schedule_id})
             logger.info(f"Post agendado {schedule_id} enviado e removido.")
-        else: # Post recorrente
-            repetitions = post.get("repetitions")
-            if repetitions is not None and repetitions != 0:
-                if repetitions == 1:
-                    schedules_collection.delete_one({"_id": schedule_id})
-                    job.schedule_next_run_time = None
-                    logger.info(f"Post recorrente {schedule_id} completou suas repetições.")
-                else:
-                    schedules_collection.update_one({"_id": schedule_id}, {"$inc": {"repetitions": -1}})
+        elif post.get("repetitions") is not None:
+            if post["repetitions"] == 1:
+                schedules_collection.delete_one({"_id": schedule_id})
+                job.schedule_next_run_time = None
+                logger.info(f"Post recorrente {schedule_id} completou suas repetições.")
+            elif post["repetitions"] != 0:
+                schedules_collection.update_one({"_id": schedule_id}, {"$inc": {"repetitions": -1}})
 
     except Exception as e:
         logger.error(f"Erro ao enviar post {schedule_id} para {chat_id}: {e}")
@@ -126,6 +115,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @restricted
 async def start_schedule_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
     command = update.message.text.split(' ')[0]
     context.user_data['schedule_type'] = 'agendada' if command in ['/agendar'] else 'recorrente'
     await update.message.reply_text("Ok, vamos criar uma nova postagem! ✨\n\nPrimeiro, envie o ID do canal/grupo de destino.")
@@ -134,7 +124,7 @@ async def start_schedule_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def get_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         context.user_data['chat_id'] = int(update.message.text)
-        await update.message.reply_text("Ótimo! Agora, envie a mídia (foto/vídeo) ou digite `Pular`.")
+        await update.message.reply_text("Ótimo! Agora, envie a mídia (foto/vídeo) ou digite `Pular`.", reply_markup=ReplyKeyboardMarkup([['Pular']], one_time_keyboard=True))
         return GET_MEDIA
     except ValueError:
         await update.message.reply_text("❌ ID inválido. Por favor, envie um ID numérico.")
@@ -151,18 +141,72 @@ async def get_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data['media_file_id'] = update.message.video.file_id
         context.user_data['media_type'] = 'video'
     else:
-        await update.message.reply_text("Formato não suportado. Envie foto, vídeo ou digite `Pular`.")
+        await update.message.reply_text("Formato não suportado. Envie foto, vídeo ou 'Pular'.")
         return GET_MEDIA
-    await update.message.reply_text("Entendido. Agora, envie o texto ou digite `Pular`.")
+    await update.message.reply_text("Entendido. Agora, envie o texto ou digite `Pular`.", reply_markup=ReplyKeyboardMarkup([['Pular']], one_time_keyboard=True))
     return GET_TEXT
 
 async def get_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Este é apenas um exemplo de como seria o fluxo, você precisará implementar a lógica completa dos botões
+    if update.message.text and update.message.text.lower() != 'pular':
+        context.user_data['text'] = update.message.text
+        await update.message.reply_text("Texto salvo! ✅")
+    else:
+        context.user_data['text'] = None
+        await update.message.reply_text("Ok, postagem sem texto. ✅")
+    reply_keyboard = [['Adicionar Botão', 'Pular']]
+    await update.message.reply_text("\nQuer adicionar um botão com link à sua postagem?", reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
+    return GET_BUTTONS_PROMPT
+
+async def get_buttons_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if 'adicionar' in update.message.text.lower():
+        context.user_data['buttons'] = []
+        await update.message.reply_text("Qual será o **texto do primeiro botão**?", reply_markup=ReplyKeyboardRemove())
+        return GET_BUTTON_1_TEXT
+    else:
+        context.user_data['buttons'] = []
+        return await ask_for_schedule_time(update, context)
+
+async def get_button_1_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['current_button_text'] = update.message.text
+    await update.message.reply_text("Agora, envie o **LINK (URL)** para este botão.")
+    return GET_BUTTON_1_URL
+
+async def get_button_1_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text
+    if not (url.startswith('http://') or url.startswith('https://')):
+        await update.message.reply_text("❌ Link inválido. Deve começar com `http://` ou `https://`. Tente novamente.")
+        return GET_BUTTON_1_URL
+    context.user_data['buttons'].append({'text': context.user_data['current_button_text'], 'url': url})
+    reply_keyboard = [['Adicionar 2º Botão', 'Finalizar Botões']]
+    await update.message.reply_text("Primeiro botão adicionado! ✅\n\nDeseja adicionar um segundo botão?", reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
+    return GET_BUTTON_2_PROMPT
+
+async def get_button_2_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if 'adicionar' in update.message.text.lower():
+        await update.message.reply_text("Qual será o **texto do segundo botão**?", reply_markup=ReplyKeyboardRemove())
+        return GET_BUTTON_2_TEXT
+    else:
+        return await ask_for_schedule_time(update, context)
+
+async def get_button_2_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['current_button_text'] = update.message.text
+    await update.message.reply_text("E qual o **LINK (URL)** para o segundo botão?")
+    return GET_BUTTON_2_URL
+    
+async def get_button_2_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text
+    if not (url.startswith('http://') or url.startswith('https://')):
+        await update.message.reply_text("❌ Link inválido. Tente novamente.")
+        return GET_BUTTON_2_URL
+    context.user_data['buttons'].append({'text': context.user_data['current_button_text'], 'url': url})
+    return await ask_for_schedule_time(update, context)
+
+async def ask_for_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if context.user_data['schedule_type'] == 'recorrente':
-        await update.message.reply_text("Qual o intervalo? (Ex: `30m`, `2h`, `1d`)")
+        await update.message.reply_text("Tudo pronto! Agora, qual o intervalo? (Ex: `30m`, `2h`, `1d`)", reply_markup=ReplyKeyboardRemove())
         return GET_INTERVAL
     else:
-        await update.message.reply_text("Quando devo enviar? Use: AAAA-MM-DD HH:MM")
+        await update.message.reply_text("Tudo pronto! Para quando devo agendar? (AAAA-MM-DD HH:MM)", reply_markup=ReplyKeyboardRemove())
         return GET_SCHEDULE_TIME
         
 async def get_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -177,7 +221,7 @@ async def get_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return GET_INTERVAL
     context.user_data['interval_value'] = value
     context.user_data['interval_unit'] = unit
-    await update.message.reply_text("Quantas vezes repetir? (Digite `0` para infinito)")
+    await update.message.reply_text("Intervalo definido! ✅\n\nQuantas vezes repetir? (Digite `0` para infinito)")
     return GET_REPETITIONS
 
 async def get_repetitions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -188,18 +232,12 @@ async def get_repetitions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except ValueError:
         await update.message.reply_text("Por favor, envie um número válido (0 ou maior).")
         return GET_REPETITIONS
-    await update.message.reply_text("Quando devo começar a enviar? Use: AAAA-MM-DD HH:MM")
+    await update.message.reply_text("Quando devo começar a enviar a **primeira** postagem? Use: AAAA-MM-DD HH:MM")
     return GET_START_TIME
 
-# =================================================================================
-# ✅✅✅ FUNÇÃO ATUALIZADA COM O MODO "DEDO-DURO" ✅✅✅
-# =================================================================================
 async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE, is_recurrent: bool = False) -> int:
     try:
-        logger.info("--- INICIANDO PROCESSO DE AGENDAMENTO FINAL ---")
         time_str = update.message.text
-        logger.info(f"CHECKPOINT 1: Data/hora recebida: {time_str}")
-
         try:
             schedule_dt_naive = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
             schedule_dt_aware = SAO_PAULO_TZ.localize(schedule_dt_naive)
@@ -210,12 +248,10 @@ async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE, is_r
             await update.message.reply_text("❌ Formato de data/hora inválido. Use AAAA-MM-DD HH:MM. Tente novamente.")
             return GET_SCHEDULE_TIME if not is_recurrent else GET_START_TIME
         
-        logger.info("CHECKPOINT 2: Data/hora validada com sucesso.")
-
         post_data = {
             "user_id": update.effective_user.id, "chat_id": context.user_data['chat_id'],
             "type": context.user_data['schedule_type'], "media_file_id": context.user_data.get('media_file_id'),
-            "media_type": context.user_data.get('media_type'), "text": update.message.text if context.user_data.get('text') is None else context.user_data.get('text'),
+            "media_type": context.user_data.get('media_type'), "text": context.user_data.get('text'),
             "buttons": context.user_data.get('buttons', []), "created_at": datetime.now(SAO_PAULO_TZ)
         }
         if is_recurrent:
@@ -223,10 +259,8 @@ async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE, is_r
             post_data['repetitions'] = context.user_data['repetitions']
             post_data['start_date'] = schedule_dt_aware
             
-        logger.info("CHECKPOINT 3: Dados preparados. Inserindo no MongoDB...")
         result = schedules_collection.insert_one(post_data)
         schedule_id = result.inserted_id
-        logger.info(f"CHECKPOINT 4: Inserido no MongoDB com sucesso. ID: {schedule_id}")
         
         job_data = {"schedule_id": str(schedule_id)}
         if is_recurrent:
@@ -237,10 +271,7 @@ async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE, is_r
         else:
             context.job_queue.run_once(send_post, schedule_dt_aware, name=str(schedule_id), data=job_data)
         
-        logger.info("CHECKPOINT 5: Job agendado no APScheduler.")
-        
         await update.message.reply_text("🚀 **Sucesso!** Sua postagem foi agendada.", reply_markup=ReplyKeyboardRemove())
-        logger.info("--- PROCESSO DE AGENDAMENTO FINALIZADO COM SUCESSO ---")
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -260,19 +291,43 @@ async def schedule_recurrent_post(update: Update, context: ContextTypes.DEFAULT_
 
 @restricted
 async def list_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Implementar a listagem
-    await update.message.reply_text("Listando posts...")
+    message = "📅 *Suas Postagens Agendadas e Recorrentes*\n\n"
+    found_any = False
+    for post in schedules_collection.find({"user_id": update.effective_user.id}).sort("created_at", -1):
+        found_any = True
+        post_type = "Agendada" if post['type'] == 'agendada' else "Recorrente"
+        text_snippet = (post.get('text') or "Sem texto")[:50] + "..."
+        message += f"🆔 `{post['_id']}`\n"
+        message += f"🎯 `Alvo`: {post['chat_id']}\n"
+        message += f"🔄 `Tipo`: {post_type}\n"
+        message += f"📝 `Texto`: _{text_snippet}_\n\n"
+    if not found_any:
+        message = "Você ainda não tem nenhuma postagem agendada."
+    await update.message.reply_text(message, parse_mode='Markdown')
 
 @restricted
 async def cancel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Implementar o cancelamento
-    await update.message.reply_text("Cancelando post...")
+    try:
+        schedule_id_str = context.args[0]
+        schedule_id = ObjectId(schedule_id_str)
+        deleted_post = schedules_collection.find_one_and_delete({"_id": schedule_id, "user_id": update.effective_user.id})
+        if not deleted_post:
+            await update.message.reply_text("❌ Agendamento não encontrado ou não pertence a você.")
+            return
+        jobs = context.job_queue.get_jobs_by_name(str(schedule_id))
+        if jobs:
+            for job in jobs:
+                job.schedule_removal()
+        await update.message.reply_text(f"✅ Agendamento `{schedule_id_str}` cancelado com sucesso!")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Uso incorreto. Envie: `/cancelar <ID_DO_AGENDAMENTO>`")
+    except Exception as e:
+        await update.message.reply_text(f"Ocorreu um erro: {e}")
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text("Processo cancelado.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
-
 
 # --- Configuração do Keep-Alive ---
 app = Flask(__name__)
@@ -283,7 +338,7 @@ def run_flask(): app.run(host='0.0.0.0', port=8080)
 # --- Função Principal ---
 def main() -> None:
     if not all([TELEGRAM_TOKEN, MONGO_URI, ADMIN_IDS]):
-        logger.error("Uma ou mais variáveis de ambiente essenciais não foram definidas.")
+        logger.error("ERRO CRÍTICO: Variáveis de ambiente não foram definidas.")
         return
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -294,6 +349,12 @@ def main() -> None:
             SELECT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_channel)],
             GET_MEDIA: [MessageHandler(filters.ALL & ~filters.COMMAND, get_media)],
             GET_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_text)],
+            GET_BUTTONS_PROMPT: [MessageHandler(filters.Regex('^(Adicionar Botão|Pular)$'), get_buttons_prompt)],
+            GET_BUTTON_1_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_1_text)],
+            GET_BUTTON_1_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_1_url)],
+            GET_BUTTON_2_PROMPT: [MessageHandler(filters.Regex('^(Adicionar 2º Botão|Finalizar Botões)$'), get_button_2_prompt)],
+            GET_BUTTON_2_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_2_text)],
+            GET_BUTTON_2_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_button_2_url)],
             GET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_single_post)],
             GET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_interval)],
             GET_REPETITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_repetitions)],
@@ -307,19 +368,24 @@ def main() -> None:
     application.add_handler(CommandHandler("cancelar", cancel_post))
     application.add_handler(conv_handler)
     
+    scheduler = AsyncIOScheduler(timezone=SAO_PAULO_TZ)
     # Recarregar jobs do DB ao iniciar
-    if schedules_collection is not None:
-        all_schedules = schedules_collection.find({})
-        for post in all_schedules:
-            # Lógica para reagendar jobs (complexa, omitida para simplicidade, mas necessária em produção)
-            pass
-
-    # Inicia o servidor Flask em uma thread separada
+    if schedules_collection:
+        for post in schedules_collection.find({}):
+            schedule_id_str = str(post['_id'])
+            job_data = {"schedule_id": schedule_id_str}
+            if post['type'] == 'agendada':
+                scheduler.add_job(send_post, 'date', run_date=post['start_date'], name=schedule_id_str, args=[job_data])
+            else: # Recorrente
+                unit = post['interval'][-1]
+                value = int(post['interval'][:-1])
+                interval_kwargs = {'minutes': value} if unit == 'm' else {'hours': value} if unit == 'h' else {'days': value}
+                scheduler.add_job(send_post, 'interval', **interval_kwargs, start_date=post['start_date'], name=schedule_id_str, args=[job_data])
+    scheduler.start()
+    
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-
-    # Inicia o bot
     application.run_polling()
 
 if __name__ == "__main__":
