@@ -1,0 +1,6 @@
+python-telegram-bot[ext]
+pymongo[srv]
+apscheduler
+pytz
+flask
+python-dotenv
