@@ -1,3 +1,5 @@
-python-telegram-bot
+python-telegram-bot[job-queue]
 firebase-admin
 pytz
+Flask
+gunicorn
