@@ -1,4 +1,3 @@
-# Exemplo de requirements.txt
+python-telegram-bot
 firebase-admin
-python-telegram-bot 
-# Adicione outras bibliotecas que seu bot usar, uma por linha.
+pytz
