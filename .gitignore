@@ -1,15 +1,7 @@
-# Byte-compiled / optimized / DLL files
+# Ignora o arquivo de credenciais secretas
+credentials.json
+
+# Outros arquivos comuns do Python a serem ignorados
 __pycache__/
 *.pyc
-*.so
-
-# Environments
 .env
-.venv
-env/
-venv/
-ENV/
-
-# Outros
-.idea/
-*.iml
