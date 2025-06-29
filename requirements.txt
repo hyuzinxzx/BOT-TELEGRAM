@@ -1,6 +1,4 @@
-python-telegram-bot[ext]
-pymongo[srv]
-apscheduler
-pytz
-flask
-python-dotenv
+# Exemplo de requirements.txt
+firebase-admin
+python-telegram-bot 
+# Adicione outras bibliotecas que seu bot usar, uma por linha.
